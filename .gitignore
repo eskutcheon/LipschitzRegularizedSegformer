@@ -172,3 +172,10 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+
+
+# data directory created by Pytorch or HuggingFace
+data/
+# model checkpoints created by Pytorch or HuggingFace
+checkpoints/

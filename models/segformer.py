@@ -1,11 +1,12 @@
 import math
 from typing import Optional, Callable, Any
 import torch
-from transformers import SegformerForSemanticSegmentation, SegformerForImageClassification
+from transformers import SegformerForSemanticSegmentation, SegformerForImageClassification, SegformerConfig
 from transformers.models.segformer.modeling_segformer import SegformerDecodeHead
 # from transformers.modeling_outputs import SemanticSegmenterOutput
+# local imports
 #from models.lipschitz_linear import LipschitzLinear
-
+from .layer_registry import create_lipschitz_layer
 
 
 
@@ -41,52 +42,47 @@ class L2SelfAttention(torch.nn.Module):
 
 
 
-#! FIXME: rename this at least - it should be replace with direct use of the `LipschitzMLP` class but this is the one that actually got
+#! FIXME: rename this at least - it should be replaced with direct use of the `LipschitzMLP` class but this is the one that actually got
     #! updated to allow for the geometric mean of the Lipschitz constants - LipschitzMLP is almost entirely from the original author's code
 class LipschitzSegformerLinear(torch.nn.Module):
     """ Linear Embedding with Lipschitz-regularized linear layer """
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_dim: int, output_dim: int, lipschitz_strategy: str):
         super().__init__()
-        self.proj = LipschitzLinear(input_dim, output_dim)
+        #self.proj = LipschitzLinear(input_dim, output_dim)
+        self.proj = create_lipschitz_layer(lipschitz_strategy, input_dim, output_dim)
 
     # TODO: need to transition to some builder pattern for setting the particular Lipschitz layer to use
 
-    def get_lipschitz_loss(self):
+    def get_lipschitz_constant(self):
         # Return the Lipschitz constant of the projection layer
         return self.proj.get_lipschitz_constant()
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = hidden_states.flatten(2).transpose(1, 2)  # (B, N, C)
-        hidden_states = self.proj(hidden_states)  # Apply the Lipschitz linear layer
-        return hidden_states
+        return self.proj(hidden_states)  # apply the Lipschitz linear layer and return the output
 
 
 
 # this MLP structure is just to keep the original logic of `transformers.models.segformer.modeling_segformer.SegformerDecodeHead` intact
 class SegformerLipschitzDecoderHead(SegformerDecodeHead):
-    def __init__(self, config):
+    def __init__(self, config: SegformerConfig, lipschitz_strategy: Optional[str] = "geometric_mean"):
         super().__init__(config)
+        # TODO: make the default strategy the old infinity norm version from the source paper
         # linear layers which will unify the channel dimension of each of the encoder blocks to the same config.decoder_hidden_size
-        #^ UPDATE: replaced the SegformerMLP instances with LipschitzSegformerLinear (exclusively for the decoder layers, not the other feedforward layers)
-        mlps = []
-        for i in range(config.num_encoder_blocks): # default num_encoder_blocks is 4
-            mlp = LipschitzSegformerLinear(
-                input_dim=config.hidden_sizes[i],
-                output_dim=config.decoder_hidden_size
-            )
-            mlps.append(mlp)
+        mlp_layers = [
+            LipschitzSegformerLinear(config.hidden_sizes[i], config.decoder_hidden_size, lipschitz_strategy)
+            for i in range(config.num_encoder_blocks)
+        ]
         # essentially the only change to the original SegformerDecodeHead is overwriting self.linear_c below
-        self.linear_c = torch.nn.ModuleList(mlps)
+        self.linear_c = torch.nn.ModuleList(mlp_layers)
 
-    def get_lipschitz_loss(self):
+    def get_lipschitz_loss(self) -> torch.Tensor:
         #loss = torch.prod(torch.tensor([mlp.get_lipschitz_loss() for mlp in self.linear_c]))
-        lipschitz_constants = torch.tensor([mlp.get_lipschitz_loss() for mlp in self.linear_c])
+        lipschitz_constants = torch.tensor([layer.get_lipschitz_constant() for layer in self.linear_c])
         # return numerically stable geometric mean of the Lipschitz constants
-        loss = torch.exp(torch.mean(torch.log(lipschitz_constants), dim=0))
-        #print("lipschitz loss (geometric mean of constants) before scaling: ", loss)
+        # TODO: consider setting regularization loss functions in the layers via a higher-order function so regularization follows different strategies
+        loss = torch.exp(torch.mean(torch.log(lipschitz_constants)))
         return loss
-
-
 
 
 
@@ -94,31 +90,24 @@ class SegformerLipschitzDecoderHead(SegformerDecodeHead):
 #!! FIXME: need to iron these classes out using only the new LipschitzLinear layers where applicable
 
 class LRSegformerForSegmentation(SegformerForSemanticSegmentation):
-    def __init__(self, config):
-        super().__init__(config)
-        #^ added the following to overwrite the original decode_head with the Lipschitz version
-        #self.decode_head = SegformerLipschitzDecoderHead(config)
-
-    def set_decoder(self, ):
-        # needs to reset `self.decode_head` from the original Segformer model to the Lipschitz version
-        pass
+    def replace_decoder_layers(self, lipschitz_strategy: str):
+        """ replace the superclass's decoder layers with Lipschitz layers - not the most efficient way to do this but it works """
+        del self.decode_head # remove the original decoder head
+        self.decode_head = SegformerLipschitzDecoderHead(self.config, lipschitz_strategy)
 
     def get_lipschitz_loss(self):
         return self.decode_head.get_lipschitz_loss()
 
+    # TODO: add new forward method that calls the superclass's forward method but accepts keyword arguments compatible with the trainer
 
+
+# TODO: eventually override the base class' constructors (still subclassing SegformerPreTrainedModel) to more efficiently do this - working proof of concept comes first
 class LRSegformerForClassification(SegformerForImageClassification):
-    def __init__(self, config):
-        super().__init__(config)
-        #^ added the following to overwrite the original decode_head with the Lipschitz version
-        self.classifier = LipschitzLinear(config.hidden_sizes[-1], config.num_labels)
-        #self.decode_head = SegformerLipschitzDecoderHead(config)
-
-    def set_decoder(self, decoder_layer: Optional[Callable] = None):
-        # needs to reset `self.classifier` from the original Segformer model to the Lipschitz version
-            # self.classifier is just a single linear layer for output logits
-        # self.classifier =
-        pass
+    def replace_classifier_layer(self, lipschitz_strategy: str):
+        """ replace the superclass's classifier layer (a single `torch.nn.Linear`) with a Lipschitz layer """
+        # self.classifier is a `torch.nn.Linear` layer in the superclass instantiated with `nn.Linear(config.hidden_sizes[-1], config.num_labels)``
+        in_features, out_features = self.classifier.in_features, self.classifier.out_features
+        self.classifier = create_lipschitz_layer(lipschitz_strategy, in_features, out_features)
 
     def get_lipschitz_loss(self):
-        return self.classifier.get_lipschitz_loss()
+        return self.classifier.get_lipschitz_constant()
