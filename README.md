@@ -4,6 +4,8 @@
 
 This repository contains a variant of the SegFormer architecture - a Transformer-based neural network widely recognized for its high efficiency and accuracy in semantic segmentation and image classification tasks. Here, we introduce the Lipschitz-Regularized SegFormer (LRSegformer), enhancing the original architecture by incorporating novel Lipschitz-constrained linear layers into the MLP decoder head to improve model robustness, generalization, and stability.
 
+This experiment was extended from the use of the Segformer variant regularized with the geometric mean of Lipschitz constants in my thesis experiments. The thesis document for "Beyond Clear Paths" is hosted as [open access at Proquest](https://www.proquest.com/docview/3155972317).
+
 > [!NOTE] Results will be posted after full training of each variant in the future.
 
 ---
