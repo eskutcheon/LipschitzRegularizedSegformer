@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from functools import partial
 from datasets import disable_caching
-disable_caching() # streaming so ensure no accidental disk writes
+disable_caching() # using streaming datasets so ensure no accidental disk writes
 # local imports
 import experiments.config as cfg
 from experiments.loading import (

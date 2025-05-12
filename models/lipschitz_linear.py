@@ -56,6 +56,34 @@ class LipschitzLinearBase(Module, ABC):
 
 
 
+
+class StableSoftplusLipschitzLinear(LipschitzLinearBase):
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__(in_features, out_features)
+        self.c = Parameter(torch.empty(1))
+        self.initialize_c()
+
+    def initialize_c(self):
+        with torch.no_grad():
+            init_val = torch.logsumexp(self.weight.abs(), dim=1).max()
+            self.c.data.fill_(init_val)
+
+    def stable_softplus(self, X: torch.Tensor):
+        # more numerically stable softplus implementation
+        # TODO: consider letting the beta parameter be learnable
+        return torch.nn.functional.softplus(X, beta=1, threshold=20)
+
+    def get_lipschitz_constant(self):
+        return self.stable_softplus(self.c)
+
+    def forward(self, X: torch.Tensor):
+        # normalize lipschitz constant with the infinity norm of the weight matrix (essentially the same as the publication by Liu et al.)
+        scale = self.get_lipschitz_constant() / (self.weight.abs().sum(dim=1) + 1e-8)
+        scale = scale.clamp(max=1.0)
+        return F.linear(X, self.weight * scale.unsqueeze(1), self.bias)
+
+
+
 class GeometricMeanLipschitzLinear(LipschitzLinearBase):
     """ Geometric Mean Lipschitz Linear Layer - same as the novel implementation from 'Beyond Clear Paths' """
     def __init__(self, in_features, out_features):
@@ -101,33 +129,6 @@ class SpectralNormalizedLinear(LipschitzLinearBase):
 
 
 
-class StableSoftplusLipschitzLinear(LipschitzLinearBase):
-    def __init__(self, in_features: int, out_features: int):
-        super().__init__(in_features, out_features)
-        self.c = Parameter(torch.empty(1))
-        self.initialize_c()
-
-    def initialize_c(self):
-        with torch.no_grad():
-            init_val = torch.logsumexp(self.weight.abs(), dim=1).max()
-            self.c.data.fill_(init_val)
-
-    def stable_softplus(self, X: torch.Tensor):
-        # more numerically stable softplus implementation
-        # TODO: consider letting the beta parameter be learnable
-        return torch.nn.functional.softplus(X, beta=1, threshold=20)
-
-    def get_lipschitz_constant(self):
-        return self.stable_softplus(self.c)
-
-    def forward(self, X: torch.Tensor):
-        # normalize lipschitz constant with the infinity norm of the weight matrix (essentially the same as the publication by Liu et al.)
-        scale = self.get_lipschitz_constant() / (self.weight.abs().sum(dim=1) + 1e-8)
-        scale = scale.clamp(max=1.0)
-        return F.linear(X, self.weight * scale.unsqueeze(1), self.bias)
-
-
-
 class OrthogonalLipschitzLinear(LipschitzLinearBase):
     def __init__(self, in_features: int, out_features: int):
         # initialize through torch.nn.Module since the weight matrix will be parameterized differently
@@ -166,14 +167,14 @@ class OrthogonalLipschitzLinear(LipschitzLinearBase):
         # pre-process all vectors at once by taking only the first in_features columns then normalizing them
             #? for contracting layers, this will be all the Householder vectors
         vectors = self.householder_vectors[:, :self.in_features]
+        # normalize v for numerical stability with Euclidean norm and small tolerance
         norms = torch.linalg.norm(vectors, dim=1, ord=2, keepdim=True)
         vectors = vectors / (norms + TOL)
         # apply each Householder reflection in sequence
         for i in range(self.n_reflectors):
             v = vectors[i]
-            # normalize v for numerical stability with Euclidean norm and small tolerance
             # $$H = I - 2 * vv^T$$
-            # weight <- weight @ H  <==>  weight <- weight - 2 * weight @ (vv^T)
+            # weight <- weight @ H      <==>    weight <- weight - 2 * weight @ (vv^T)
             ##projection = torch.matmul(weight, v[:self.in_features].unsqueeze(1)).squeeze(-1)
             ##weight = weight - 2 * torch.outer(projection, v[:self.in_features])
             weight = weight - 2 * torch.outer(weight @ v, v)
